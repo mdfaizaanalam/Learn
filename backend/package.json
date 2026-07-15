@@ -6,8 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "encrypt": "node encrypt.js",
-    "postinstall": "cd .. && npm install && npm run build"
+    "encrypt": "node encrypt.js"
   },
   "dependencies": {
     "@getbrevo/brevo": "^6.0.2",
