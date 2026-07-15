@@ -276,11 +276,16 @@ const createSubscriptionPayload = (user) => {
 // ── BREVO EMAIL SENDER (HTTP API) ────────────────────────────────────────────
 const sendEmailViaAPI = async ({ toEmail, toName, subject, htmlContent }) => {
   const apiKey = process.env.SMTP_API_KEY;
-  const senderEmail = process.env.SMTP_SENDER || process.env.SMTP_LOGIN;
+  const senderEmail = process.env.SMTP_SENDER || (process.env.SMTP_LOGIN && !process.env.SMTP_LOGIN.endsWith('@smtp-brevo.com') ? process.env.SMTP_LOGIN : undefined);
 
   if (!apiKey) {
     console.error('[Email] SMTP_API_KEY is not defined in environment variables.');
     throw new Error('Email configuration error: SMTP_API_KEY missing');
+  }
+
+  if (!senderEmail) {
+    console.error('[Email] SMTP_SENDER is not defined in environment variables.');
+    throw new Error('Email configuration error: SMTP_SENDER missing');
   }
 
   if (apiKey.startsWith('xsmtpsib-')) {
@@ -327,11 +332,17 @@ const sendEmailViaAPI = async ({ toEmail, toName, subject, htmlContent }) => {
 };
 
 // Log email setup readiness on startup
-if (process.env.SMTP_API_KEY) {
-  if (process.env.SMTP_API_KEY.startsWith('xsmtpsib-')) {
+const startupApiKey = process.env.SMTP_API_KEY;
+const startupSenderEmail = process.env.SMTP_SENDER || (process.env.SMTP_LOGIN && !process.env.SMTP_LOGIN.endsWith('@smtp-brevo.com') ? process.env.SMTP_LOGIN : undefined);
+
+if (startupApiKey) {
+  if (startupApiKey.startsWith('xsmtpsib-')) {
     console.warn('[Email] Warning: You configured SMTP_API_KEY with an SMTP key (starts with "xsmtpsib-"). The HTTP API requires a Brevo API Key (starts with "xkeysib-"). Please generate one in your Brevo Dashboard under SMTP & API > API Keys.');
   } else {
     console.log('[Email] Brevo API configured. Ready to send emails via HTTP API.');
+  }
+  if (!startupSenderEmail) {
+    console.warn('[Email] Warning: SMTP_SENDER is missing in environment variables. You must specify a verified sender email address.');
   }
 } else {
   console.warn('[Email] Warning: SMTP_API_KEY is missing. Emails will fail to send.');
@@ -361,7 +372,11 @@ const generateOtp = () => Math.floor(100000 + Math.random() * 900000).toString()
 
 const sendOtpEmail = async (toEmail, username, otp) => {
   // IMPORTANT: 'from' must match a VERIFIED SENDER in your Brevo account
-  const verifiedSender = process.env.SMTP_SENDER || process.env.SMTP_LOGIN;
+  const verifiedSender = process.env.SMTP_SENDER || (process.env.SMTP_LOGIN && !process.env.SMTP_LOGIN.endsWith('@smtp-brevo.com') ? process.env.SMTP_LOGIN : undefined);
+  if (!verifiedSender) {
+    console.error('[Email] SMTP_SENDER is not defined in environment variables.');
+    throw new Error('Email configuration error: SMTP_SENDER missing');
+  }
   const mailOptions = {
     from: `"TestAS Mastery" <${verifiedSender}>`,
     to: toEmail,
@@ -775,7 +790,11 @@ app.post('/api/auth/logout', (req, res) => {
 const PASSWORD_RESET_EXPIRY_MS = 30 * 60 * 1000; // 30 minutes
 
 const sendPasswordResetEmail = async (toEmail, username, resetLink) => {
-  const verifiedSender = process.env.SMTP_SENDER || process.env.SMTP_LOGIN;
+  const verifiedSender = process.env.SMTP_SENDER || (process.env.SMTP_LOGIN && !process.env.SMTP_LOGIN.endsWith('@smtp-brevo.com') ? process.env.SMTP_LOGIN : undefined);
+  if (!verifiedSender) {
+    console.error('[Email] SMTP_SENDER is not defined in environment variables.');
+    throw new Error('Email configuration error: SMTP_SENDER missing');
+  }
   const mailOptions = {
     from: `"TestAS Mastery" <${verifiedSender}>`,
     to: toEmail,
