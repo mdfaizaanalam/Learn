@@ -1403,6 +1403,10 @@ if (fs.existsSync(distPath)) {
   app.get('*', (req, res) => {
     res.sendFile(path.join(distPath, 'index.html'));
   });
+} else {
+  app.get('/', (req, res) => {
+    res.status(200).send('TestAS Mastery API is running successfully. (Frontend build is building or not present)');
+  });
 }
 
 // Start Server
