@@ -1,0 +1,28 @@
+{
+  "name": "testas-mastery-backend",
+  "version": "1.0.0",
+  "description": "Backend API for TestAS Mastery subscription and security features",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "encrypt": "node encrypt.js"
+  },
+  "dependencies": {
+    "@getbrevo/brevo": "^6.0.2",
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.5.2",
+    "jsonwebtoken": "^9.0.2",
+    "mailtrap": "^4.6.1",
+    "nodemailer": "^9.0.3",
+    "pg": "^8.22.0",
+    "sib-api-v3-sdk": "^8.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1"
+  }
+}
