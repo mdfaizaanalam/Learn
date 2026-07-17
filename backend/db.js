@@ -76,16 +76,40 @@ export const initSchema = async () => {
     );
   `;
 
+  // Stores each user's daily 30-question challenge, answers, and completion status.
+  // One row per user per day — enables cross-device sync and streak verification.
+  const dailyChallengesTableQuery = `
+    CREATE TABLE IF NOT EXISTS daily_challenges (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      challenge_date DATE NOT NULL,
+      questions JSONB NOT NULL,
+      answers JSONB DEFAULT '{}',
+      score INTEGER DEFAULT 0,
+      is_completed BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, challenge_date)
+    );
+  `;
+
   try {
     await query(userTableQuery);
     await query(usedPaymentsTableQuery);
     await query(passwordResetTokensTableQuery);
+    await query(dailyChallengesTableQuery);
 
     // Create the user subscription sync trigger function
     await query(`
       CREATE OR REPLACE FUNCTION sync_user_subscription_trigger()
       RETURNS TRIGGER AS $$
       BEGIN
+        -- If user transitions to premium (or premium status is initialized), reset solved counts to 0
+        IF NEW.is_subscribed = TRUE AND (TG_OP = 'INSERT' OR OLD.is_subscribed IS DISTINCT FROM TRUE) THEN
+          NEW.latin_used_today := 0;
+          NEW.figure_used_today := 0;
+          NEW.math_used_today := 0;
+        END IF;
+
         -- If is_subscribed is manually set to TRUE, and the query did NOT explicitly provide/change the plan_end_date,
         -- then automatically calculate and sync the premium plan details.
         IF NEW.is_subscribed = TRUE 

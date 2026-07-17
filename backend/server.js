@@ -107,6 +107,7 @@ const normalizeUsageType = (usageTypeRaw) => {
 };
 
 const syncUserSubscriptionState = async (user) => {
+  const originalPlanType = user.plan_type;
   let { planType, planStartDate, planEndDate } = resolveSubscriptionDates(user);
 
   // Developer override logic: if is_subscribed is marked true manually in the
@@ -154,6 +155,12 @@ const syncUserSubscriptionState = async (user) => {
     toIsoDateString(user.plan_start_date) !== toIsoDateString(normalizedPlanStartDate);
 
   if (needsUpdate) {
+    const becamePremium = isPremiumPlan(planType) && !isPremiumPlan(originalPlanType);
+    if (becamePremium) {
+      user.latin_used_today = 0;
+      user.figure_used_today = 0;
+      user.math_used_today = 0;
+    }
     await db.query(
       `UPDATE users SET
         plan_type = $1,
@@ -161,14 +168,18 @@ const syncUserSubscriptionState = async (user) => {
         is_subscribed = $3,
         plan_start_date = $4,
         plan_end_date = $5,
+        latin_used_today = CASE WHEN $6 = true THEN 0 ELSE latin_used_today END,
+        figure_used_today = CASE WHEN $6 = true THEN 0 ELSE figure_used_today END,
+        math_used_today = CASE WHEN $6 = true THEN 0 ELSE math_used_today END,
         updated_at = CURRENT_TIMESTAMP
-       WHERE id = $6`,
+       WHERE id = $7`,
       [
         planType,
         computedStatus,
         shouldBeSubscribed,
         normalizedPlanStartDate,
         normalizedPlanEndDate,
+        becamePremium,
         user.id
       ]
     );
@@ -192,11 +203,12 @@ const resetDailyCounters = async (user) => {
   //
   // This single atomic UPDATE only resets (and only touches updated_at) when
   // last_usage_reset_date is NOT today according to Postgres itself.
+  // We do not reset the counts for premium active plans at midnight.
   const result = await db.query(
     `UPDATE users SET
-      latin_used_today = CASE WHEN last_usage_reset_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE latin_used_today END,
-      figure_used_today = CASE WHEN last_usage_reset_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE figure_used_today END,
-      math_used_today = CASE WHEN last_usage_reset_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE math_used_today END,
+      latin_used_today = CASE WHEN plan_type IN ('monthly', 'quarterly') THEN latin_used_today WHEN last_usage_reset_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE latin_used_today END,
+      figure_used_today = CASE WHEN plan_type IN ('monthly', 'quarterly') THEN figure_used_today WHEN last_usage_reset_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE figure_used_today END,
+      math_used_today = CASE WHEN plan_type IN ('monthly', 'quarterly') THEN math_used_today WHEN last_usage_reset_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE math_used_today END,
       last_usage_reset_date = CURRENT_DATE,
       updated_at = CASE WHEN last_usage_reset_date IS DISTINCT FROM CURRENT_DATE THEN CURRENT_TIMESTAMP ELSE updated_at END
      WHERE id = $1
@@ -439,7 +451,11 @@ const sendOtpEmail = async (toEmail, username, otp) => {
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_testas_mastery_key_987654321';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error("CRITICAL: JWT_SECRET is not set in environment variables! Server cannot start securely.");
+  process.exit(1);
+}
 const COOKIE_OPTIONS = {
   httpOnly: true,
   secure: process.env.NODE_ENV === 'production',
@@ -1027,6 +1043,7 @@ app.post('/api/subscription/usage', authenticateUser, async (req, res) => {
     }
 
     if (isPremiumPlan(user.plan_type)) {
+      await incrementUsage(user, usageType);
       return res.json({
         success: true,
         message: "Premium user has unlimited access.",
@@ -1112,6 +1129,275 @@ app.post('/api/user/stats', authenticateUser, async (req, res) => {
   } catch (err) {
     console.error("Error updating user stats:", err);
     res.status(500).json({ error: "Failed to update stats in database." });
+  }
+});
+
+// ── EVERYDAY STREAK TASK ENDPOINTS ───────────────────────────────────────────
+
+// Helper to check if streak is broken (i.e. more than 1 day missed between last completion and today)
+function isStreakBroken(lastPlayedStr, todayStr) {
+  if (!lastPlayedStr) return false;
+  try {
+    const lastPlayed = new Date(lastPlayedStr);
+    const today = new Date(todayStr);
+    if (isNaN(lastPlayed.getTime()) || isNaN(today.getTime())) {
+      return false;
+    }
+    // Clear time portions for day-based difference
+    lastPlayed.setHours(0, 0, 0, 0);
+    today.setHours(0, 0, 0, 0);
+    const diffTime = today.getTime() - lastPlayed.getTime();
+    const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+    return diffDays > 1;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Helper to get yesterday string (YYYY-MM-DD) relative to a client YYYY-MM-DD dateStr
+function getYesterdayStr(dateStr) {
+  try {
+    const parts = dateStr.split('-');
+    if (parts.length !== 3) return null;
+    const year = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10) - 1;
+    const day = parseInt(parts[2], 10);
+    const d = new Date(Date.UTC(year, month, day));
+    d.setUTCDate(d.getUTCDate() - 1);
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Fetch today's challenge
+app.get('/api/everyday/today', authenticateUser, async (req, res) => {
+  const dateStr = req.query.date;
+  if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    return res.status(400).json({ error: "Invalid or missing date parameter. Expected YYYY-MM-DD." });
+  }
+
+  const userId = req.user.id;
+
+  try {
+    const userResult = await db.query('SELECT streak, last_played_date, xp, level FROM users WHERE id = $1', [userId]);
+    const user = userResult.rows[0];
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    let currentStreak = user.streak || 0;
+    const lastCompleted = user.last_played_date;
+
+    if (lastCompleted && isStreakBroken(lastCompleted, dateStr)) {
+      currentStreak = 0;
+      await db.query('UPDATE users SET streak = 0 WHERE id = $1', [userId]);
+    }
+
+    const challengeResult = await db.query(
+      'SELECT * FROM daily_challenges WHERE user_id = $1 AND challenge_date = $2',
+      [userId, dateStr]
+    );
+
+    if (challengeResult.rows.length === 0) {
+      return res.status(404).json({ 
+        error: "Challenge not initialized yet for today.",
+        streak: currentStreak 
+      });
+    }
+
+    const challenge = challengeResult.rows[0];
+    res.json({
+      found: true,
+      challenge: {
+        questions: challenge.questions,
+        answers: challenge.answers || {},
+        score: challenge.score || 0,
+        isCompleted: challenge.is_completed || false,
+        challengeDate: dateStr
+      },
+      streak: currentStreak
+    });
+  } catch (err) {
+    console.error("Error fetching today challenge:", err);
+    res.status(500).json({ error: "Failed to fetch today's challenge." });
+  }
+});
+
+// Initialize today's challenge
+app.post('/api/everyday/init', authenticateUser, async (req, res) => {
+  const { date, questions } = req.body;
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Array.isArray(questions)) {
+    return res.status(400).json({ error: "Invalid input. Expected date (YYYY-MM-DD) and questions array." });
+  }
+
+  const userId = req.user.id;
+
+  try {
+    const result = await db.query(
+      `INSERT INTO daily_challenges (user_id, challenge_date, questions, answers, score, is_completed)
+       VALUES ($1, $2, $3, '{}', 0, false)
+       ON CONFLICT (user_id, challenge_date) 
+       DO UPDATE SET user_id = EXCLUDED.user_id 
+       RETURNING *`,
+      [userId, date, JSON.stringify(questions)]
+    );
+
+    const challenge = result.rows[0];
+    const userResult = await db.query('SELECT streak FROM users WHERE id = $1', [userId]);
+
+    res.json({
+      success: true,
+      challenge: {
+        questions: challenge.questions,
+        answers: challenge.answers || {},
+        score: challenge.score || 0,
+        isCompleted: challenge.is_completed || false,
+        challengeDate: date
+      },
+      streak: userResult.rows[0]?.streak || 0
+    });
+  } catch (err) {
+    console.error("Error initializing everyday challenge:", err);
+    res.status(500).json({ error: "Failed to initialize challenge." });
+  }
+});
+
+// Submit answer for everyday challenge
+app.post('/api/everyday/answer', authenticateUser, async (req, res) => {
+  const { date, questionIndex, answer } = req.body;
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || questionIndex === undefined || answer === undefined) {
+    return res.status(400).json({ error: "Invalid input." });
+  }
+
+  const userId = req.user.id;
+
+  try {
+    const challengeResult = await db.query(
+      'SELECT * FROM daily_challenges WHERE user_id = $1 AND challenge_date = $2',
+      [userId, date]
+    );
+
+    if (challengeResult.rows.length === 0) {
+      return res.status(404).json({ error: "Challenge not found." });
+    }
+
+    const challenge = challengeResult.rows[0];
+    const questions = challenge.questions;
+    let answers = challenge.answers || {};
+    let score = challenge.score || 0;
+
+    // Check if already answered
+    if (answers[questionIndex] !== undefined) {
+      const question = questions[questionIndex];
+      let isCorrect = false;
+      if (question) {
+        isCorrect = typeof answer === 'object' && answer !== null
+          ? answer.selectedIndex === question.correctOptionIndex
+          : answer === question.correctOptionIndex;
+      }
+      return res.json({ success: true, isCorrect, score, answers });
+    }
+
+    // Save answer
+    answers[questionIndex] = answer;
+
+    // Calculate correctness
+    const question = questions[questionIndex];
+    let isCorrect = false;
+    if (question) {
+      isCorrect = typeof answer === 'object' && answer !== null
+        ? answer.selectedIndex === question.correctOptionIndex
+        : answer === question.correctOptionIndex;
+    }
+
+    if (isCorrect) {
+      score += 1;
+    }
+
+    // Update DB
+    await db.query(
+      `UPDATE daily_challenges 
+       SET answers = $1, score = $2
+       WHERE user_id = $3 AND challenge_date = $4`,
+      [JSON.stringify(answers), score, userId, date]
+    );
+
+    res.json({ success: true, isCorrect, score, answers });
+  } catch (err) {
+    console.error("Error submitting daily challenge answer:", err);
+    res.status(500).json({ error: "Failed to submit answer." });
+  }
+});
+
+// Complete everyday challenge
+app.post('/api/everyday/complete', authenticateUser, async (req, res) => {
+  const { date } = req.body;
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: "Invalid date format." });
+  }
+
+  const userId = req.user.id;
+
+  try {
+    const challengeResult = await db.query(
+      'SELECT * FROM daily_challenges WHERE user_id = $1 AND challenge_date = $2',
+      [userId, date]
+    );
+
+    if (challengeResult.rows.length === 0) {
+      return res.status(404).json({ error: "Challenge not found." });
+    }
+
+    const challenge = challengeResult.rows[0];
+    if (challenge.is_completed) {
+      const userResult = await db.query('SELECT streak, xp, level FROM users WHERE id = $1', [userId]);
+      const user = userResult.rows[0];
+      return res.json({ success: true, streak: user.streak, xp: user.xp, level: user.level });
+    }
+
+    // Update challenge to completed
+    await db.query(
+      'UPDATE daily_challenges SET is_completed = true WHERE user_id = $1 AND challenge_date = $2',
+      [userId, date]
+    );
+
+    // Update streak, last_played_date, and XP
+    const userResult = await db.query('SELECT streak, last_played_date, xp, level FROM users WHERE id = $1', [userId]);
+    const user = userResult.rows[0];
+    
+    const lastCompleted = user.last_played_date;
+    const yesterdayStr = getYesterdayStr(date);
+
+    let newStreak = 1;
+    if (lastCompleted === date) {
+      newStreak = user.streak || 1;
+    } else if (lastCompleted === yesterdayStr) {
+      newStreak = (user.streak || 0) + 1;
+    }
+
+    const newXp = (user.xp || 0) + 300;
+    const newLevel = Math.floor(newXp / 1000) + 1;
+
+    await db.query(
+      `UPDATE users 
+       SET streak = $1, last_played_date = $2, xp = $3, level = $4
+       WHERE id = $5`,
+      [newStreak, date, newXp, newLevel, userId]
+    );
+
+    res.json({
+      success: true,
+      streak: newStreak,
+      xp: newXp,
+      level: newLevel
+    });
+  } catch (err) {
+    console.error("Error completing daily challenge:", err);
+    res.status(500).json({ error: "Failed to complete challenge." });
   }
 });
 
@@ -1205,6 +1491,9 @@ if (process.env.NODE_ENV !== 'production') {
             plan_end_date = $2,
             subscribed_at = $1,
             subscription_status = 'active',
+            latin_used_today = 0,
+            figure_used_today = 0,
+            math_used_today = 0,
             updated_at = CURRENT_TIMESTAMP
            WHERE id = $3`,
           [start, end, user.id]
@@ -1300,6 +1589,9 @@ app.post('/api/payment/verify', authenticateUser, async (req, res) => {
         plan_start_date = $2,
         plan_end_date = $2 + ($3::interval),
         subscription_status = 'active',
+        latin_used_today = 0,
+        figure_used_today = 0,
+        math_used_today = 0,
         updated_at = CURRENT_TIMESTAMP
        WHERE id = $5`,
       [razorpay_payment_id, verifiedAt, planDuration, planType, user.id]

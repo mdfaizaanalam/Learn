@@ -10,7 +10,11 @@ const __dirname = path.dirname(__filename);
 // Load env
 dotenv.config({ path: path.join(__dirname, '.env') });
 
-const KEY_STRING = process.env.PDF_ENCRYPTION_KEY || 'TESTAS_MASTERY_SECURE_KEY_123456';
+const KEY_STRING = process.env.PDF_ENCRYPTION_KEY;
+if (!KEY_STRING) {
+  console.error("CRITICAL: PDF_ENCRYPTION_KEY is not set in environment variables!");
+  process.exit(1);
+}
 // Derive a 32-byte key using SHA-256
 const key = crypto.createHash('sha256').update(KEY_STRING).digest();
 
