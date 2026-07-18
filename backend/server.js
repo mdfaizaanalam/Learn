@@ -91,6 +91,43 @@ const resolveSubscriptionDates = (user) => {
 
 const isPremiumPlan = (planType) => planType === 'monthly' || planType === 'quarterly';
 
+// Full progress reset performed the moment a user becomes premium — whether
+// via a real Razorpay payment or the dev testing endpoint. Both paths call
+// this SAME function so they can never drift out of sync again. Resets:
+//   - users row: XP, level, streak, games_played, fastest_solve_seconds,
+//     cognitive profile, topic mastery, last_played_date, daily usage counters
+//   - practice_sessions: deletes all trial-period rows for the 3 core
+//     practice modules (Latin Square / Figure Sequence / Math) — this is
+//     what "Core Practice Progress" on the Dashboard reads from
+//   - exam_sessions: deletes all trial-period exam attempts — this is what
+//     win rate / sessions / fastest-solve history reads from
+//   - user_achievements: deletes all unlocked achievements
+// After this, the user's Dashboard, Core Practice Progress, and Analytics
+// all start climbing from a clean 0 for the new paid plan period.
+const resetUserProgressForNewSubscription = async (userId) => {
+  await db.query(
+    `UPDATE users SET
+      xp = 0,
+      level = 1,
+      streak = 0,
+      last_played_date = NULL,
+      games_played = 0,
+      fastest_solve_seconds = NULL,
+      cognitive_profile = '{"figureReasoning":50,"mathLogic":50,"verbal":50,"speed":50,"accuracy":50,"consistency":50}',
+      topic_mastery = '{}',
+      latin_used_today = 0,
+      figure_used_today = 0,
+      math_used_today = 0,
+      updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1`,
+    [userId]
+  );
+
+  await db.query(`DELETE FROM practice_sessions WHERE user_id = $1`, [userId]);
+  await db.query(`DELETE FROM exam_sessions WHERE user_id = $1`, [userId]);
+  await db.query(`DELETE FROM user_achievements WHERE user_id = $1`, [userId]);
+};
+
 const checkSubscriptionStatus = (user) => {
   const { planType, planEndDate } = resolveSubscriptionDates(user);
   const status = VALID_STATUSES.has(user.subscription_status) ? user.subscription_status : 'active';
@@ -143,8 +180,8 @@ const syncUserSubscriptionState = async (user) => {
   }
 
   const statusFromDb = VALID_STATUSES.has(user.subscription_status) ? user.subscription_status : 'active';
-  const computedStatus = (user.is_subscribed || !isSubscriptionExpired(planEndDate)) ? statusFromDb : 'expired';
-  const shouldBeSubscribed = user.is_subscribed || (isPremiumPlan(planType) && computedStatus === 'active' && !isSubscriptionExpired(planEndDate));
+  const computedStatus = !isSubscriptionExpired(planEndDate) ? statusFromDb : 'expired';
+  const shouldBeSubscribed = isPremiumPlan(planType) && computedStatus === 'active' && !isSubscriptionExpired(planEndDate);
   const normalizedPlanStartDate = planStartDate || parseDateSafe(user.created_at) || new Date();
   const normalizedPlanEndDate = planEndDate || new Date(normalizedPlanStartDate.getTime() + 3 * 24 * 60 * 60 * 1000);
   const needsUpdate =
@@ -157,6 +194,15 @@ const syncUserSubscriptionState = async (user) => {
   if (needsUpdate) {
     const becamePremium = isPremiumPlan(planType) && !isPremiumPlan(originalPlanType);
     if (becamePremium) {
+      await resetUserProgressForNewSubscription(user.id);
+      user.xp = 0;
+      user.level = 1;
+      user.streak = 0;
+      user.last_played_date = null;
+      user.games_played = 0;
+      user.fastest_solve_seconds = null;
+      user.cognitive_profile = {figureReasoning:50,mathLogic:50,verbal:50,speed:50,accuracy:50,consistency:50};
+      user.topic_mastery = {};
       user.latin_used_today = 0;
       user.figure_used_today = 0;
       user.math_used_today = 0;
@@ -575,11 +621,12 @@ const authenticateUser = async (req, res, next) => {
       `SELECT
         id, username, email, created_at, updated_at,
         is_subscribed, subscription_id,
-        xp, level, streak, last_played_date, accuracy, games_played, games_won,
+        xp, level, streak, last_played_date, games_played, fastest_solve_seconds,
+        cognitive_profile, topic_mastery, settings,
         subscribed_at,
         plan_type, plan_start_date, plan_end_date, subscription_status,
         latin_used_today, figure_used_today, math_used_today, last_usage_reset_date,
-        max_pages_read
+        max_pages_read, library_favorites, library_recents, library_progress
       FROM users
       WHERE id = $1`,
       [decoded.userId]
@@ -689,7 +736,7 @@ app.post('/api/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
       `INSERT INTO users
       (username, email, password_hash, created_at, updated_at, plan_type, plan_start_date, plan_end_date, subscription_status, latin_used_today, figure_used_today, math_used_today, last_usage_reset_date)
       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, 'trial', $5, $6, 'active', 0, 0, 0, CURRENT_DATE)
-      RETURNING id, username, email, created_at, is_subscribed, plan_type, subscription_status, plan_start_date, plan_end_date`,
+      RETURNING id, username, email, created_at, is_subscribed, plan_type, subscription_status, plan_start_date, plan_end_date, settings`,
       [finalUsername, normalizedEmail, passwordHash, createdAt, planStartDate, planEndDate]
     );
 
@@ -718,7 +765,11 @@ app.post('/api/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
         subscriptionStatus: newUser.subscription_status,
         subscribedAt: null,
         subscriptionEndsAt: newUser.plan_end_date,
-        maxPagesRead: 0
+        maxPagesRead: 0,
+        settings: newUser.settings,
+        libraryFavorites: newUser.library_favorites || [],
+        libraryRecents: newUser.library_recents || [],
+        libraryProgress: newUser.library_progress || {}
       }
     });
 
@@ -781,12 +832,17 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
         level: normalizedUser.level,
         streak: normalizedUser.streak,
         lastPlayedDate: normalizedUser.last_played_date,
-        accuracy: normalizedUser.accuracy,
         gamesPlayed: normalizedUser.games_played,
-        gamesWon: normalizedUser.games_won,
+        fastestSolveSeconds: normalizedUser.fastest_solve_seconds,
+        cognitiveProfile: normalizedUser.cognitive_profile,
+        topicMastery: normalizedUser.topic_mastery,
+        settings: normalizedUser.settings,
         subscribedAt: normalizedUser.subscribed_at,
         subscriptionEndsAt: normalizedUser.plan_end_date,
-        maxPagesRead: normalizedUser.max_pages_read
+        maxPagesRead: normalizedUser.max_pages_read,
+        libraryFavorites: normalizedUser.library_favorites || [],
+        libraryRecents: normalizedUser.library_recents || [],
+        libraryProgress: normalizedUser.library_progress || {}
       }
     });
 
@@ -972,11 +1028,31 @@ app.post('/api/auth/reset-password', passwordResetLimiter, async (req, res) => {
 });
 
 // Get Current User Profile (Checks active session)
-app.get('/api/auth/me', authenticateUser, (req, res) => {
+app.get('/api/auth/me', authenticateUser, async (req, res) => {
   const user = req.user;
   const isSubscribedActive = checkSubscriptionStatus(user);
   const trialExpired = user.plan_type === 'trial' && user.subscription_status !== 'active';
   const daysLeft = user.plan_type === 'trial' ? calculateRemainingDays(user.plan_end_date) : 0;
+
+  // Compute accuracy & games_won from exam_sessions in real-time
+  let accuracy = 100;
+  let gamesWon = 0;
+  try {
+    const statsRes = await db.query(
+      `SELECT
+        COUNT(*) AS total_sessions,
+        COALESCE(SUM(correct_answers), 0) AS total_correct,
+        COALESCE(SUM(total_questions), 0) AS total_questions,
+        COUNT(*) FILTER (WHERE score_percent >= 50) AS sessions_won
+       FROM exam_sessions WHERE user_id = $1`,
+      [user.id]
+    );
+    const s = statsRes.rows[0];
+    if (s && parseInt(s.total_questions) > 0) {
+      accuracy = Math.round((parseInt(s.total_correct) / parseInt(s.total_questions)) * 100);
+    }
+    gamesWon = parseInt(s?.sessions_won || 0);
+  } catch (_) { }
 
   res.json({
     user: {
@@ -991,14 +1067,21 @@ app.get('/api/auth/me', authenticateUser, (req, res) => {
       level: user.level,
       streak: user.streak,
       lastPlayedDate: user.last_played_date,
-      accuracy: user.accuracy,
+      accuracy,
       gamesPlayed: user.games_played,
-      gamesWon: user.games_won,
+      gamesWon,
+      fastestSolveSeconds: user.fastest_solve_seconds,
+      cognitiveProfile: user.cognitive_profile,
+      topicMastery: user.topic_mastery,
+      settings: user.settings,
       subscribedAt: user.subscribed_at,
       subscriptionEndsAt: user.plan_end_date,
       planType: user.plan_type,
       subscriptionStatus: user.subscription_status,
-      maxPagesRead: user.max_pages_read
+      maxPagesRead: user.max_pages_read,
+      libraryFavorites: user.library_favorites || [],
+      libraryRecents: user.library_recents || [],
+      libraryProgress: user.library_progress || {}
     }
   });
 });
@@ -1098,37 +1181,589 @@ app.post('/api/subscription/usage', authenticateUser, async (req, res) => {
   }
 });
 
-// Update User Gamification Stats
-app.post('/api/user/stats', authenticateUser, async (req, res) => {
-  const { xp, level, streak, lastPlayedDate, accuracy, gamesPlayed, gamesWon } = req.body;
+// ── CORE PRACTICE SESSION RECORDING ──────────────────────────────────────────
+// These endpoints are SEPARATE from exam sessions.
+// Practice sessions track ONLY correct answers solved in free practice mode
+// (Latin Square, Figure Sequences, Math Reasoning). No wrong/skipped tracking.
+// Exam sessions (timed simulator) are tracked separately in /api/exam/session.
+
+// POST /api/practice/session — Record a correctly solved question in free practice
+app.post('/api/practice/session', authenticateUser, async (req, res) => {
   const user = req.user;
+  const { module, correctCount } = req.body;
+  // module: 'latin-square' | 'figure-sequence' | 'math-equations'
+
+  const VALID_PRACTICE_MODULES = new Set(['latin-square', 'figure-sequence', 'math-equations']);
+  if (!module || !VALID_PRACTICE_MODULES.has(module)) {
+    return res.status(400).json({ error: 'Missing or invalid module. Allowed: latin-square, figure-sequence, math-equations.' });
+  }
+
+  const safeCorrect = Math.max(0, parseInt(correctCount) || 0);
+  if (safeCorrect === 0) {
+    // Nothing to record for 0 correct — return silently OK
+    return res.json({ success: true, message: 'No correct answers to record.' });
+  }
 
   try {
     await db.query(
-      `UPDATE users SET 
-        xp = COALESCE($1, xp),
-        level = COALESCE($2, level),
-        streak = COALESCE($3, streak),
-        last_played_date = COALESCE($4, last_played_date),
-        accuracy = COALESCE($5, accuracy),
-        games_played = COALESCE($6, games_played),
-        games_won = COALESCE($7, games_won)
-       WHERE id = $8`,
+      `INSERT INTO practice_sessions (user_id, module, correct_count, plan_type)
+       VALUES ($1, $2, $3, $4)`,
+      [user.id, module, safeCorrect, user.plan_type]
+    );
+
+    // Award XP: 5 XP per correct practice answer (less than exam to keep exam meaningful)
+    const xpEarned = safeCorrect * 5;
+    const newXp = (user.xp || 0) + xpEarned;
+    const newLevel = Math.floor(newXp / 1000) + 1;
+
+    await db.query(
+      `UPDATE users SET xp = $1, level = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+      [newXp, newLevel, user.id]
+    );
+
+    return res.json({ success: true, xpEarned, newXp, newLevel });
+  } catch (err) {
+    console.error('Error recording practice session:', err);
+    return res.status(500).json({ error: 'Failed to record practice session.' });
+  }
+});
+
+// GET /api/practice/stats — Aggregated practice stats per module
+// Tracks CORRECTLY SOLVED questions (not attempts) — the right metric for a progress dashboard.
+// Trial users  : counts correct answers solved since account creation (never resets daily —
+//               this is a running total for the life of the trial, distinct from the
+//               daily attempt limit shown on the Subscription page, which DOES reset daily).
+// Premium users: counts correct answers solved since their plan_start_date so the count
+//               resets to 0 on upgrade and accumulates for the life of the subscription.
+app.get('/api/practice/stats', authenticateUser, async (req, res) => {
+  const user = req.user;
+  try {
+    const isPremium = isPremiumPlan(user.plan_type) && user.subscription_status === 'active';
+    // Premium: boundary is plan_start_date (resets to 0 on every new subscription period).
+    // Trial: boundary is account creation — the count accumulates for the whole trial and
+    // is NOT tied to the daily usage-limit reset (that's a separate counter/table).
+    const periodStartDate = isPremium
+      ? (user.plan_start_date ? new Date(user.plan_start_date) : null)
+      : (user.created_at ? new Date(user.created_at) : null);
+    const periodStart = periodStartDate ? periodStartDate.toISOString() : null;
+
+    // Both branches use the same query shape — only the date boundary differs,
+    // and neither branch is tied to "today" anymore.
+    const [totalRes, byModuleRes] = await Promise.all([
+      db.query(
+        `SELECT
+          COALESCE(SUM(correct_count), 0) AS total_correct,
+          COUNT(*) AS total_sessions
+         FROM practice_sessions
+         WHERE user_id = $1
+           AND ($2::timestamptz IS NULL OR practiced_at >= $2::timestamptz)`,
+        [user.id, periodStartDate]
+      ),
+      db.query(
+        `SELECT
+          module,
+          COALESCE(SUM(correct_count), 0) AS total_correct,
+          COUNT(*) AS sessions
+         FROM practice_sessions
+         WHERE user_id = $1
+           AND ($2::timestamptz IS NULL OR practiced_at >= $2::timestamptz)
+         GROUP BY module
+         ORDER BY total_correct DESC`,
+        [user.id, periodStartDate]
+      )
+    ]);
+
+    return res.json({
+      totalCorrect: parseInt(totalRes.rows[0]?.total_correct || 0),
+      totalSessions: parseInt(totalRes.rows[0]?.total_sessions || 0),
+      isPremium,
+      periodStart: periodStart || null,
+      byModule: byModuleRes.rows.map(r => ({
+        module: r.module,
+        totalCorrect: parseInt(r.total_correct),
+        sessions: parseInt(r.sessions)
+      }))
+    });
+  } catch (err) {
+    console.error('Error fetching practice stats:', err);
+    return res.status(500).json({ error: 'Failed to fetch practice stats.' });
+  }
+});
+
+// ── EXAM SESSION RECORDING ────────────────────────────────────────────────────
+// These endpoints record TIMED EXAM SIMULATOR sessions only.
+// They store full correct/wrong/skipped/time data for progress tracking.
+
+// POST /api/exam/session — Record a completed exam simulator session
+// Called by the frontend when the user views their results.
+app.post('/api/exam/session', authenticateUser, async (req, res) => {
+  const user = req.user;
+  const {
+    module,       // 'figure-sequence' | 'math-equations' | 'latin-square' | 'medicine' | 'engineering' | 'math-cs' | 'full'
+    examType,     // 'core' | 'subject' | 'full'
+    totalQuestions,
+    correctAnswers,
+    wrongAnswers,
+    skipped,
+    timeTakenSeconds
+  } = req.body;
+
+  if (!module || totalQuestions === undefined || correctAnswers === undefined) {
+    return res.status(400).json({ error: 'Missing required fields: module, totalQuestions, correctAnswers.' });
+  }
+
+  const safeTotal = Math.max(1, parseInt(totalQuestions) || 1);
+  const safeCorrect = Math.min(parseInt(correctAnswers) || 0, safeTotal);
+  const safeWrong = Math.min(parseInt(wrongAnswers) || 0, safeTotal - safeCorrect);
+  const safeSkipped = parseInt(skipped) || (safeTotal - safeCorrect - safeWrong);
+  const scorePercent = Math.round((safeCorrect / safeTotal) * 100);
+  const safeTime = parseInt(timeTakenSeconds) || 0;
+
+  try {
+    // 1. Insert exam session row
+    const sessionResult = await db.query(
+      `INSERT INTO exam_sessions
+        (user_id, module, exam_type, total_questions, correct_answers, wrong_answers, skipped, score_percent, time_taken_seconds, plan_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       RETURNING id, completed_at`,
+      [user.id, module, examType || 'core', safeTotal, safeCorrect, safeWrong, safeSkipped, scorePercent, safeTime, user.plan_type]
+    );
+
+    // 2. Award XP: correct answers × 10 + time bonus
+    const xpEarned = (safeCorrect * 10) + (scorePercent >= 80 ? 50 : 0) + (scorePercent === 100 ? 100 : 0);
+    const newXp = (user.xp || 0) + xpEarned;
+    const newLevel = Math.floor(newXp / 1000) + 1;
+    const newGamesPlayed = (user.games_played || 0) + 1;
+
+    // 3. Update fastest solve if better
+    const currentFastest = user.fastest_solve_seconds;
+    const newFastest = (safeTime > 0 && scorePercent === 100)
+      ? (currentFastest === null || safeTime < currentFastest ? safeTime : currentFastest)
+      : currentFastest;
+
+    // 4. Update streak and last_played_date
+    const todayStr = toIsoDateString(new Date());
+    const yesterdayStr = getYesterdayStr(todayStr);
+    const lastPlayed = user.last_played_date;
+
+    let newStreak = user.streak || 0;
+    if (!lastPlayed) {
+      newStreak = 1;
+    } else if (lastPlayed === yesterdayStr) {
+      newStreak = (user.streak || 0) + 1;
+    } else if (lastPlayed !== todayStr) {
+      newStreak = 1;
+    }
+
+    await db.query(
+      `UPDATE users SET
+        xp = $1,
+        level = $2,
+        games_played = $3,
+        fastest_solve_seconds = COALESCE($4, fastest_solve_seconds),
+        streak = $5,
+        last_played_date = $6,
+        updated_at = CURRENT_TIMESTAMP
+       WHERE id = $7`,
+      [newXp, newLevel, newGamesPlayed, newFastest, newStreak, todayStr, user.id]
+    );
+
+    // 4. Compute live accuracy & games_won for the response
+    const analyticsRes = await db.query(
+      `SELECT
+        COALESCE(SUM(correct_answers), 0) AS total_correct,
+        COALESCE(SUM(total_questions), 0) AS total_questions,
+        COUNT(*) FILTER (WHERE score_percent >= 50) AS games_won
+       FROM exam_sessions WHERE user_id = $1`,
+      [user.id]
+    );
+    const agg = analyticsRes.rows[0];
+    const liveAccuracy = parseInt(agg.total_questions) > 0
+      ? Math.round((parseInt(agg.total_correct) / parseInt(agg.total_questions)) * 100)
+      : 100;
+
+    return res.json({
+      success: true,
+      sessionId: sessionResult.rows[0]?.id,
+      completedAt: sessionResult.rows[0]?.completed_at,
+      xpEarned,
+      newXp,
+      newLevel,
+      newGamesPlayed,
+      gamesWon: parseInt(agg.games_won || 0),
+      accuracy: liveAccuracy,
+      fastestSolveSeconds: newFastest,
+      scorePercent
+    });
+  } catch (err) {
+    console.error('Error recording exam session:', err);
+    return res.status(500).json({ error: 'Failed to record exam session.' });
+  }
+});
+
+// GET /api/exam/history — Full paginated exam history
+app.get('/api/exam/history', authenticateUser, async (req, res) => {
+  const user = req.user;
+  const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+  const offset = parseInt(req.query.offset) || 0;
+
+  try {
+    const [historyRes, countRes] = await Promise.all([
+      db.query(
+        `SELECT id, module, exam_type, total_questions, correct_answers, wrong_answers, skipped,
+                score_percent, time_taken_seconds, plan_type, completed_at
+         FROM exam_sessions
+         WHERE user_id = $1
+         ORDER BY completed_at DESC
+         LIMIT $2 OFFSET $3`,
+        [user.id, limit, offset]
+      ),
+      db.query('SELECT COUNT(*) FROM exam_sessions WHERE user_id = $1', [user.id])
+    ]);
+
+    return res.json({
+      sessions: historyRes.rows,
+      totalCount: parseInt(countRes.rows[0].count)
+    });
+  } catch (err) {
+    console.error('Error fetching exam history:', err);
+    return res.status(500).json({ error: 'Failed to fetch exam history.' });
+  }
+});
+// DELETE /api/exam/history — User deletes their own entire history (full progress reset)
+app.delete('/api/exam/history', authenticateUser, async (req, res) => {
+  const user = req.user;
+  try {
+    // Perform full progress reset to keep DB tables (practice, exams, achievements, users) synchronized
+    await resetUserProgressForNewSubscription(user.id);
+    return res.json({ success: true, message: 'All training history, achievements, and stats reset successfully.' });
+  } catch (err) {
+    console.error('Error deleting history:', err);
+    return res.status(500).json({ error: 'Failed to delete history.' });
+  }
+});
+// GET /api/user/analytics — Aggregated analytics from DB
+// For premium users, all exam_sessions and practice_sessions are filtered
+// from plan_start_date onward — so upgrading resets visible stats to 0.
+app.get('/api/user/analytics', authenticateUser, async (req, res) => {
+  const user = req.user;
+  try {
+    // Use plan_start_date as filter boundary for premium users so stats
+    // reset to 0 at the moment of upgrade without deleting historical data.
+    const isPremium = isPremiumPlan(user.plan_type) && user.subscription_status === 'active';
+    const periodStart = isPremium && user.plan_start_date
+      ? new Date(user.plan_start_date).toISOString()
+      : null;
+
+    const [aggRes, byModuleRes, recentRes, userRes] = await Promise.all([
+      // Overall totals — filtered by period for premium
+      db.query(
+        `SELECT
+          COUNT(*) AS total_sessions,
+          COALESCE(SUM(total_questions), 0) AS total_questions,
+          COALESCE(SUM(correct_answers), 0) AS total_correct,
+          COALESCE(SUM(wrong_answers), 0) AS total_wrong,
+          COALESCE(SUM(skipped), 0) AS total_skipped,
+          COUNT(*) FILTER (WHERE score_percent >= 50) AS sessions_won,
+          COALESCE(AVG(score_percent), 0) AS avg_score
+         FROM exam_sessions
+         WHERE user_id = $1
+           AND ($2::timestamptz IS NULL OR completed_at >= $2::timestamptz)`,
+        [user.id, periodStart]
+      ),
+      // Per-module breakdown — filtered by period
+      db.query(
+        `SELECT
+          module,
+          COUNT(*) AS sessions,
+          COALESCE(SUM(total_questions), 0) AS total_questions,
+          COALESCE(SUM(correct_answers), 0) AS correct,
+          COALESCE(SUM(wrong_answers), 0) AS wrong,
+          COALESCE(AVG(score_percent), 0) AS avg_score
+         FROM exam_sessions
+         WHERE user_id = $1
+           AND ($2::timestamptz IS NULL OR completed_at >= $2::timestamptz)
+         GROUP BY module
+         ORDER BY sessions DESC`,
+        [user.id, periodStart]
+      ),
+      // Last 10 sessions for learning curve — filtered by period
+      db.query(
+        `SELECT module, score_percent, completed_at, total_questions, correct_answers, wrong_answers, time_taken_seconds
+         FROM exam_sessions
+         WHERE user_id = $1
+           AND ($2::timestamptz IS NULL OR completed_at >= $2::timestamptz)
+         ORDER BY completed_at DESC LIMIT 10`,
+        [user.id, periodStart]
+      ),
+      // User gamification fields
+      db.query(
+        `SELECT xp, level, streak, games_played, fastest_solve_seconds, cognitive_profile, topic_mastery, last_played_date
+         FROM users WHERE id = $1`,
+        [user.id]
+      )
+    ]);
+
+    const agg = aggRes.rows[0];
+    const totalQ = parseInt(agg.total_questions);
+    const accuracy = totalQ > 0
+      ? Math.round((parseInt(agg.total_correct) / totalQ) * 100)
+      : 100;
+
+    return res.json({
+      totalSessions: parseInt(agg.total_sessions),
+      totalQuestions: totalQ,
+      totalCorrect: parseInt(agg.total_correct),
+      totalWrong: parseInt(agg.total_wrong),
+      totalSkipped: parseInt(agg.total_skipped),
+      sessionsWon: parseInt(agg.sessions_won),
+      avgScore: Math.round(parseFloat(agg.avg_score)),
+      accuracy,
+      byModule: byModuleRes.rows,
+      recentSessions: recentRes.rows,
+      isPremium,
+      periodStart,
+      xp: userRes.rows[0]?.xp || 0,
+      level: userRes.rows[0]?.level || 1,
+      streak: userRes.rows[0]?.streak || 0,
+      gamesPlayed: userRes.rows[0]?.games_played || 0,
+      fastestSolveSeconds: userRes.rows[0]?.fastest_solve_seconds || null,
+      cognitiveProfile: userRes.rows[0]?.cognitive_profile,
+      topicMastery: userRes.rows[0]?.topic_mastery,
+      lastPlayedDate: userRes.rows[0]?.last_played_date
+    });
+  } catch (err) {
+    console.error('Error fetching analytics:', err);
+    return res.status(500).json({ error: 'Failed to fetch analytics.' });
+  }
+});
+
+// POST /api/user/profile — Save cognitive profile + topic mastery to DB
+app.post('/api/user/profile', authenticateUser, async (req, res) => {
+  const user = req.user;
+  const { cognitiveProfile, topicMastery } = req.body;
+
+  if (!cognitiveProfile && !topicMastery) {
+    return res.status(400).json({ error: 'Provide cognitiveProfile or topicMastery.' });
+  }
+
+  try {
+    await db.query(
+      `UPDATE users SET
+        cognitive_profile = COALESCE($1::jsonb, cognitive_profile),
+        topic_mastery = COALESCE($2::jsonb, topic_mastery),
+        updated_at = CURRENT_TIMESTAMP
+       WHERE id = $3`,
       [
-        xp !== undefined ? xp : null,
-        level !== undefined ? level : null,
-        streak !== undefined ? streak : null,
-        lastPlayedDate !== undefined ? lastPlayedDate : null,
-        accuracy !== undefined ? accuracy : null,
-        gamesPlayed !== undefined ? gamesPlayed : null,
-        gamesWon !== undefined ? gamesWon : null,
+        cognitiveProfile ? JSON.stringify(cognitiveProfile) : null,
+        topicMastery ? JSON.stringify(topicMastery) : null,
         user.id
       ]
     );
-    res.json({ success: true });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Error saving user profile:', err);
+    return res.status(500).json({ error: 'Failed to save profile.' });
+  }
+});
+
+// GET /api/user/settings — Load UI/app settings (theme, symbol system, sound, etc.)
+app.get('/api/user/settings', authenticateUser, async (req, res) => {
+  const user = req.user;
+  try {
+    const result = await db.query(`SELECT settings FROM users WHERE id = $1`, [user.id]);
+    return res.json({ settings: result.rows[0]?.settings || {} });
+  } catch (err) {
+    console.error('Error loading user settings:', err);
+    return res.status(500).json({ error: 'Failed to load settings.' });
+  }
+});
+
+// POST /api/user/settings — Save UI/app settings to DB (merged with existing values)
+app.post('/api/user/settings', authenticateUser, async (req, res) => {
+  const user = req.user;
+  const settings = req.body;
+
+  if (!settings || typeof settings !== 'object') {
+    return res.status(400).json({ error: 'Provide a settings object.' });
+  }
+
+  try {
+    const result = await db.query(
+      `UPDATE users SET
+        settings = COALESCE(settings, '{}'::jsonb) || $1::jsonb,
+        updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING settings`,
+      [JSON.stringify(settings), user.id]
+    );
+    return res.json({ success: true, settings: result.rows[0]?.settings });
+  } catch (err) {
+    console.error('Error saving user settings:', err);
+    return res.status(500).json({ error: 'Failed to save settings.' });
+  }
+});
+
+// POST /api/user/stats — Update user gamification fields (streak, xp, level, etc.)
+app.post('/api/user/stats', authenticateUser, async (req, res) => {
+  const user = req.user;
+  const { streak, xp, level } = req.body;
+
+  try {
+    const updates = [];
+    const values = [];
+    let idx = 1;
+
+    if (streak !== undefined) {
+      updates.push(`streak = $${idx++}`);
+      values.push(parseInt(streak) || 0);
+    }
+    if (xp !== undefined) {
+      updates.push(`xp = $${idx++}`);
+      values.push(parseInt(xp) || 0);
+    }
+    if (level !== undefined) {
+      updates.push(`level = $${idx++}`);
+      values.push(parseInt(level) || 1);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No update fields provided." });
+    }
+
+    values.push(user.id);
+    const queryStr = `
+      UPDATE users
+      SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $${idx}
+      RETURNING xp, level, streak
+    `;
+
+    const result = await db.query(queryStr, values);
+    return res.json({ success: true, stats: result.rows[0] });
   } catch (err) {
     console.error("Error updating user stats:", err);
-    res.status(500).json({ error: "Failed to update stats in database." });
+    return res.status(500).json({ error: "Failed to update user stats." });
+  }
+});
+
+// GET /api/user/library — Get user's favorited books, recents, and reading progress
+app.get('/api/user/library', authenticateUser, async (req, res) => {
+  const user = req.user;
+  return res.json({
+    success: true,
+    favorites: user.library_favorites || [],
+    recents: user.library_recents || [],
+    progress: user.library_progress || {}
+  });
+});
+
+// POST /api/user/library — Save user's favorited books, recents, and/or reading progress
+app.post('/api/user/library', authenticateUser, async (req, res) => {
+  const user = req.user;
+  const { favorites, recents, progress } = req.body;
+
+  try {
+    const updates = [];
+    const values = [];
+    let idx = 1;
+
+    if (favorites !== undefined) {
+      updates.push(`library_favorites = $${idx++}`);
+      values.push(JSON.stringify(favorites));
+    }
+    if (recents !== undefined) {
+      updates.push(`library_recents = $${idx++}`);
+      values.push(JSON.stringify(recents));
+    }
+    if (progress !== undefined) {
+      updates.push(`library_progress = $${idx++}`);
+      values.push(JSON.stringify(progress));
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No library update fields provided." });
+    }
+
+    values.push(user.id);
+    const queryStr = `
+      UPDATE users
+      SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $${idx}
+      RETURNING library_favorites, library_recents, library_progress
+    `;
+
+    const result = await db.query(queryStr, values);
+    const updated = result.rows[0];
+
+    return res.json({
+      success: true,
+      favorites: updated.library_favorites,
+      recents: updated.library_recents,
+      progress: updated.library_progress
+    });
+  } catch (err) {
+    console.error("Error updating user library:", err);
+    return res.status(500).json({ error: "Failed to update user library." });
+  }
+});
+
+// GET /api/user/achievements — Get user's unlocked achievements
+app.get('/api/user/achievements', authenticateUser, async (req, res) => {
+  const user = req.user;
+  try {
+    const result = await db.query(
+      `SELECT achievement_id, unlocked_at FROM user_achievements WHERE user_id = $1 ORDER BY unlocked_at ASC`,
+      [user.id]
+    );
+    return res.json({ achievements: result.rows });
+  } catch (err) {
+    console.error('Error fetching achievements:', err);
+    return res.status(500).json({ error: 'Failed to fetch achievements.' });
+  }
+});
+
+// POST /api/user/achievements — Unlock a new achievement
+app.post('/api/user/achievements', authenticateUser, async (req, res) => {
+  const user = req.user;
+  const { achievementId, xpReward } = req.body;
+
+  if (!achievementId) {
+    return res.status(400).json({ error: 'achievementId is required.' });
+  }
+
+  try {
+    // Insert with ON CONFLICT DO NOTHING — idempotent unlock
+    const result = await db.query(
+      `INSERT INTO user_achievements (user_id, achievement_id)
+       VALUES ($1, $2)
+       ON CONFLICT (user_id, achievement_id) DO NOTHING
+       RETURNING id, unlocked_at`,
+      [user.id, achievementId]
+    );
+
+    const isNew = result.rows.length > 0;
+
+    // Award XP only if this is a genuine new unlock
+    if (isNew && xpReward && xpReward > 0) {
+      await db.query(
+        `UPDATE users SET
+          xp = COALESCE(xp, 0) + $1,
+          level = FLOOR((COALESCE(xp, 0) + $1) / 1000) + 1,
+          updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2`,
+        [xpReward, user.id]
+      );
+    }
+
+    return res.json({
+      success: true,
+      isNew,
+      unlockedAt: result.rows[0]?.unlocked_at || null
+    });
+  } catch (err) {
+    console.error('Error unlocking achievement:', err);
+    return res.status(500).json({ error: 'Failed to unlock achievement.' });
   }
 });
 
@@ -1203,9 +1838,9 @@ app.get('/api/everyday/today', authenticateUser, async (req, res) => {
     );
 
     if (challengeResult.rows.length === 0) {
-      return res.status(404).json({ 
+      return res.status(404).json({
         error: "Challenge not initialized yet for today.",
-        streak: currentStreak 
+        streak: currentStreak
       });
     }
 
@@ -1368,7 +2003,7 @@ app.post('/api/everyday/complete', authenticateUser, async (req, res) => {
     // Update streak, last_played_date, and XP
     const userResult = await db.query('SELECT streak, last_played_date, xp, level FROM users WHERE id = $1', [userId]);
     const user = userResult.rows[0];
-    
+
     const lastCompleted = user.last_played_date;
     const yesterdayStr = getYesterdayStr(date);
 
@@ -1491,13 +2126,16 @@ if (process.env.NODE_ENV !== 'production') {
             plan_end_date = $2,
             subscribed_at = $1,
             subscription_status = 'active',
-            latin_used_today = 0,
-            figure_used_today = 0,
-            math_used_today = 0,
             updated_at = CURRENT_TIMESTAMP
            WHERE id = $3`,
           [start, end, user.id]
         );
+
+        // Same full reset as a real Razorpay payment: XP/level/streak/
+        // cognitive profile/achievements AND all practice_sessions +
+        // exam_sessions history. This dev endpoint exists specifically so
+        // testing an upgrade behaves identically to a real one.
+        await resetUserProgressForNewSubscription(user.id);
       } else {
         return res.status(400).json({ success: false, message: "state must be one of: trial_active, trial_expired, subscribed" });
       }
@@ -1506,6 +2144,23 @@ if (process.env.NODE_ENV !== 'production') {
     } catch (err) {
       console.error("Dev set-plan-state error:", err);
       return res.status(500).json({ success: false, message: "Failed to set plan state." });
+    }
+  });
+
+  // Standalone reset — wipes XP/level/streak/cognitive profile/achievements
+  // and ALL practice_sessions + exam_sessions rows for the caller's own
+  // account, independent of any subscription-state transition. Use this
+  // directly when testing and you just want a clean slate right now,
+  // without needing to first flip trial->premium to trigger the reset
+  // inside /api/dev/set-plan-state.
+  app.post('/api/dev/reset-progress', authenticateUser, async (req, res) => {
+    const user = req.user;
+    try {
+      await resetUserProgressForNewSubscription(user.id);
+      return res.json({ success: true, message: 'All progress data reset to 0.' });
+    } catch (err) {
+      console.error("Dev reset-progress error:", err);
+      return res.status(500).json({ success: false, message: "Failed to reset progress." });
     }
   });
 }
@@ -1589,14 +2244,18 @@ app.post('/api/payment/verify', authenticateUser, async (req, res) => {
         plan_start_date = $2,
         plan_end_date = $2 + ($3::interval),
         subscription_status = 'active',
-        latin_used_today = 0,
-        figure_used_today = 0,
-        math_used_today = 0,
         updated_at = CURRENT_TIMESTAMP
        WHERE id = $5`,
       [razorpay_payment_id, verifiedAt, planDuration, planType, user.id]
     );
-    console.log(`User ${user.username} (ID: ${user.id}) successfully upgraded to ${planType.toUpperCase()} PREMIUM.`);
+
+    // Full reset: XP/level/streak/cognitive profile/achievements AND all
+    // practice_sessions + exam_sessions history, so every stat (core
+    // practice modules, exam simulator, games) starts fresh from 0 for
+    // the new paid plan period.
+    await resetUserProgressForNewSubscription(user.id);
+
+    console.log(`User ${user.username} (ID: ${user.id}) successfully upgraded to ${planType.toUpperCase()} PREMIUM. All stats reset to 0.`);
     return res.redirect('/dashboard?payment=success');
   } catch (err) {
     console.error("Payment verification exception:", err);
